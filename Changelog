@@ -3,6 +3,7 @@ releases are sorted from youngest to oldest.
 
 version <next>:
 - WHEP demuxer
+- WHIP muxer
 
 
 version 6.1.1
