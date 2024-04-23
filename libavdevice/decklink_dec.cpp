@@ -593,6 +593,7 @@ private:
         int no_video;
         int64_t initial_video_pts;
         int64_t initial_audio_pts;
+        IDeckLinkVideoInputFrame* last_video_frame;
 };
 
 decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : _refs(1)
@@ -602,10 +603,13 @@ decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : _ref
     ctx = (struct decklink_ctx *)cctx->ctx;
     no_video = 0;
     initial_audio_pts = initial_video_pts = AV_NOPTS_VALUE;
+    last_video_frame = nullptr;
 }
 
 decklink_input_callback::~decklink_input_callback()
 {
+    if (last_video_frame)
+        last_video_frame->Release();
 }
 
 ULONG decklink_input_callback::AddRef(void)
@@ -730,6 +734,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
     BMDTimeValue frameDuration;
     int64_t wallclock = 0, abs_wallclock = 0;
     struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
+    IDeckLinkVideoInputFrame *currentVideoFrame = videoFrame; // video frame that holds frameBytes
 
     if (ctx->autodetect) {
         if (videoFrame && !(videoFrame->GetFlags() & bmdFrameHasNoInputSource) &&
@@ -773,7 +778,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                                   ctx->video_st->time_base.den);
 
         if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
-            if (ctx->draw_bars && videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
+            if (ctx->signal_loss_action == SIGNAL_LOSS_BARS && videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
                 unsigned bars[8] = {
                     0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
                     0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
@@ -785,6 +790,9 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                     for (int x = 0; x < width; x += 2)
                         *p++ = bars[(x * 8) / width];
                 }
+            } else if (ctx->signal_loss_action == SIGNAL_LOSS_REPEAT && last_video_frame) {
+                currentVideoFrame = last_video_frame;
+                currentVideoFrame->GetBytes(&frameBytes);
             }
 
             if (!no_video) {
@@ -793,6 +801,12 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
             }
             no_video = 1;
         } else {
+            if (ctx->signal_loss_action == SIGNAL_LOSS_REPEAT) {
+                if (last_video_frame)
+                    last_video_frame->Release();
+                last_video_frame = videoFrame;
+                last_video_frame->AddRef();
+            }
             if (no_video) {
                 av_log(avctx, AV_LOG_WARNING, "Frame received (#%lu) - Input returned "
                         "- Frames dropped %u\n", ctx->frameCount, ++ctx->dropped);
@@ -854,8 +868,8 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         pkt.flags       |= AV_PKT_FLAG_KEY;
         pkt.stream_index = ctx->video_st->index;
         pkt.data         = (uint8_t *)frameBytes;
-        pkt.size         = videoFrame->GetRowBytes() *
-                           videoFrame->GetHeight();
+        pkt.size         = currentVideoFrame->GetRowBytes() *
+                           currentVideoFrame->GetHeight();
         //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
 
         if (!no_video) {
@@ -931,9 +945,9 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
             }
         }
 
-        pkt.buf = av_buffer_create(pkt.data, pkt.size, decklink_object_free, videoFrame, 0);
+        pkt.buf = av_buffer_create(pkt.data, pkt.size, decklink_object_free, currentVideoFrame, 0);
         if (pkt.buf)
-            videoFrame->AddRef();
+            currentVideoFrame->AddRef();
 
         if (ff_decklink_packet_queue_put(&ctx->queue, &pkt) < 0) {
             ++ctx->dropped;
@@ -1036,6 +1050,7 @@ av_cold int ff_decklink_read_close(AVFormatContext *avctx)
         ctx->dli->StopStreams();
         ctx->dli->DisableVideoInput();
         ctx->dli->DisableAudioInput();
+        ctx->dli->SetCallback(nullptr);
     }
 
     ff_decklink_cleanup(avctx);
@@ -1074,6 +1089,15 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     ctx->audio_pts_source = cctx->audio_pts_source;
     ctx->video_pts_source = cctx->video_pts_source;
     ctx->draw_bars = cctx->draw_bars;
+    ctx->signal_loss_action = cctx->signal_loss_action;
+    if (!ctx->draw_bars && ctx->signal_loss_action == SIGNAL_LOSS_BARS) {
+        ctx->signal_loss_action = SIGNAL_LOSS_NONE;
+        av_log(avctx, AV_LOG_WARNING, "Setting signal_loss_action to none because draw_bars is false\n");
+    }
+    if (!ctx->draw_bars && ctx->signal_loss_action != SIGNAL_LOSS_NONE) {
+        av_log(avctx, AV_LOG_ERROR, "options draw_bars and signal_loss_action are mutually exclusive\n");
+        return AVERROR(EINVAL);
+    }
     ctx->audio_depth = cctx->audio_depth;
     if (cctx->raw_format > 0 && (unsigned int)cctx->raw_format < FF_ARRAY_ELEMS(decklink_raw_format_map))
         ctx->raw_format = decklink_raw_format_map[cctx->raw_format];
